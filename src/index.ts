@@ -1,29 +1,31 @@
 import Fastify, { FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import "dotenv/config";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { PullResponse, PushResponse, pushRequestSchema, pullQuerySchema } from "./schemas";
 import { handlePull, handlePush } from "./sync";
 
 const PORT = Number(process.env.PORT ?? 3000);
-const { SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY } = process.env;
+const { SUPABASE_URL, SUPABASE_ANON_KEY } = process.env;
 
 const missing: string[] = [];
 if (!SUPABASE_URL) missing.push("SUPABASE_URL");
 if (!SUPABASE_ANON_KEY) missing.push("SUPABASE_ANON_KEY");
-if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
 if (missing.length) {
   console.error(`[chromodoro-api] missing env: ${missing.join(", ")}`);
   process.exit(1);
 }
 
-// service_role bypasses RLS (server is the gatekeeper); anon client just for getUser.
-const supabaseAdmin = createClient(SUPABASE_URL!, SUPABASE_SERVICE_ROLE_KEY!, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
 const supabaseAnon = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
+
+function createUserClient(token: string): SupabaseClient {
+  return createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { Authorization: `Bearer ${token}` } },
+  });
+}
 
 const app: FastifyInstance = Fastify({ logger: true });
 
@@ -37,7 +39,9 @@ const corsOrigins = (process.env.CORS_ORIGINS ?? "http://localhost:5173")
 app.register(cors, { origin: corsOrigins });
 
 /** Require `Authorization: Bearer <supabase access token>`, resolve to userId. */
-async function requireUser(request: { headers: { authorization?: string } }): Promise<string> {
+async function requireUser(
+  request: { headers: { authorization?: string } }
+): Promise<{ userId: string; supabase: SupabaseClient }> {
   const token = request.headers.authorization?.replace(/^Bearer\s+/i, "");
   if (!token) {
     const err = new Error("missing bearer token");
@@ -50,7 +54,7 @@ async function requireUser(request: { headers: { authorization?: string } }): Pr
     (err as Error & { code?: string }).code = "UNAUTHORIZED";
     throw err;
   }
-  return data.user.id;
+  return { userId: data.user.id, supabase: createUserClient(token) };
 }
 
 const healthCheck = async () => ({ status: "ok", time: new Date().toISOString() });
@@ -59,20 +63,20 @@ app.get("/health", healthCheck);
 app.get("/healthz", healthCheck);
 
 app.get("/auth/me", async (request) => {
-  const userId = await requireUser(request);
-  const { data } = await supabaseAdmin.from("user_settings").select("*").eq("user_id", userId).maybeSingle();
+  const { userId, supabase } = await requireUser(request);
+  const { data } = await supabase.from("user_settings").select("*").eq("user_id", userId).maybeSingle();
   return { userId, settingsUpsertedAt: data?.updated_at ?? null };
 });
 
 app.get<{ Querystring: Record<string, string | undefined> }>("/sync/pull", async (request): Promise<PullResponse> => {
-  const userId = await requireUser(request);
+  const { userId, supabase } = await requireUser(request);
   const parsed = pullQuerySchema.safeParse({ since: request.query.since });
   if (!parsed.success) throw httpError(400, JSON.stringify(parsed.error.flatten()));
-  return handlePull(supabaseAdmin, userId, parsed.data.since);
+  return handlePull(supabase, userId, parsed.data.since);
 });
 
 app.post<{ Body: unknown }>("/sync/push", async (request): Promise<PushResponse> => {
-  const userId = await requireUser(request);
+  const { userId, supabase } = await requireUser(request);
   const parsed = pushRequestSchema.safeParse(request.body ?? {});
   if (!parsed.success) {
     throw httpError(
@@ -83,7 +87,7 @@ app.post<{ Body: unknown }>("/sync/push", async (request): Promise<PushResponse>
       })
     );
   }
-  return handlePush(supabaseAdmin, userId, parsed.data);
+  return handlePush(supabase, userId, parsed.data);
 });
 
 const start = async () => {
