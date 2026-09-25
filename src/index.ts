@@ -53,7 +53,10 @@ async function requireUser(request: { headers: { authorization?: string } }): Pr
   return data.user.id;
 }
 
-app.get("/health", async () => ({ status: "ok", time: new Date().toISOString() }));
+const healthCheck = async () => ({ status: "ok", time: new Date().toISOString() });
+app.get("/", healthCheck);
+app.get("/health", healthCheck);
+app.get("/healthz", healthCheck);
 
 app.get("/auth/me", async (request) => {
   const userId = await requireUser(request);
